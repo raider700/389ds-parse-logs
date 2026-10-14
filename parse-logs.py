@@ -6,14 +6,15 @@
 # 2021 - Raider700
 #
 # This script is used to parse and combine the 389-ds logs.
-# As data store a local redis db on the default port is used.
+# The connection state is kept in the memory of the process (no redis needed).
+# Optional the state can be saved on stop and restored on start.
 #
 # Output can be:
 #   * stdout
 #   * local file
 #   * syslog server
 #
-# Additional the last success binds can be also recorded to file
+# Additional the last success binds can be also recorded to file and sqlite db
 #
 # To see all params: <scipt> -h
 #
@@ -21,13 +22,16 @@
 
 # import needed libs
 import sys
+import os
+import re
+import json
 import getopt
-import shlex
+import sqlite3
 import time
 import datetime
 import signal
 import socket
-import redis  # python-redis redis
+from collections import OrderedDict
 
 #################################################################################
 
@@ -61,45 +65,298 @@ __outlastbindfile = False
 # output on stdout
 __stdout = True
 
-# redis objects
-__redishost = "localhost"
-__redisport = 6379
-__redislogs = None
-__redislastbind = None
+# state file for restarts and sqlite db for last binds (disabled on default)
+__statefile = False
+__lastbinddb = False
+__lastbindttl = 93600  # 26h, 0 ... never expire
+__maxconnections = 100000
+
+# runtime objects
+__connections = None
+__lastbindstore = None
+__outlogwriter = None
+__outlastbindwriter = None
+
+# max age of connections in seconds
+# 1h ... 3600, 6h ... 21600, 12h ... 43200, 24h ... 86400
+CONNECTION_MAX_AGE = 86400
+CLOSED_CONNECTION_MAX_AGE = 300
+
+# intervals for the periodic tasks in seconds
+FLUSH_INTERVAL = 1
+SWEEP_INTERVAL = 60
+SNAPSHOT_INTERVAL = 300
+
+# read size for the input logfile
+READ_CHUNK_SIZE = 1024 * 1024
+
+# connection info without any data
+EMPTY_CONNECTION_INFO = "connectioninfo=false fd=0 slot=0 tls=false starttls=false port=0 from=0.0.0.0 to=0.0.0.0 autobind=none binddn=none"
+
+# split a prepared connection line into the parts around the tls fields
+CONNECTION_PATTERN = re.compile(r"^(.*?) tls=(true|false) starttls=false (.*)$")
 
 #################################################################################
 
-# class to close script on "strg+c"
+# class to close script on "strg+c" and reopen output files on "kill -HUP"
 class GracefulKiller:
     kill_now = False
+    reopen = False
 
     def __init__(self):
         signal.signal(signal.SIGINT, self.exit_gracefully)
         signal.signal(signal.SIGTERM, self.exit_gracefully)
+        signal.signal(signal.SIGHUP, self.reopen_files)
 
     def exit_gracefully(self, signum, frame):
         self.kill_now = True
 
+    def reopen_files(self, signum, frame):
+        self.reopen = True
 
-# define the redis server params
-def redis_open_connection(stage, usage):
-    db = 7
-    if stage == "p" and usage == "lastbind":
-        db = 1
-    if stage == "v" and usage == "lastbind":
-        db = 2
-    if stage == "d" and usage == "lastbind":
-        db = 3
-    if stage == "p" and usage == "logs":
-        db = 4
-    if stage == "v" and usage == "logs":
-        db = 5
-    if stage == "d" and usage == "logs":
-        db = 6
-    global __redishost
-    global __redisport
-    redisdb = db
-    return redis.Redis(host=__redishost, port=__redisport, db=redisdb)
+
+# information about a single connection and its open operations
+class Connection:
+    __slots__ = ("info", "prefix", "tls", "starttls", "suffix", "autobind", "binddn", "ops", "lastseen", "closed")
+
+    def __init__(self):
+        self.info = False
+        self.prefix = "fd=0 slot=0"
+        self.tls = "false"
+        self.starttls = "false"
+        self.suffix = "port=0 from=0.0.0.0 to=0.0.0.0"
+        self.autobind = "autobind=none"
+        self.binddn = "binddn=none"
+        self.ops = {}
+        self.lastseen = 0
+        self.closed = 0
+
+    # build the connection string for the logline
+    def render(self):
+        if self.tls is None:
+            middle = self.prefix
+        else:
+            middle = "%s tls=%s starttls=%s %s" % (self.prefix, self.tls, self.starttls, self.suffix)
+        return "CONNECTION connectioninfo=%s %s %s %s" % \
+               ("true" if self.info else "false", middle, self.autobind, self.binddn)
+
+    def dump(self):
+        return {name: getattr(self, name) for name in self.__slots__}
+
+    @classmethod
+    def load(cls, data):
+        entry = cls()
+        for name in cls.__slots__:
+            if name in data:
+                setattr(entry, name, data[name])
+        return entry
+
+
+# store for all known connections (oldest used connection first)
+class ConnectionStore:
+
+    def __init__(self, maxsize):
+        self.items = OrderedDict()
+        self.maxsize = maxsize
+
+    def get(self, con):
+        return self.items.get(con)
+
+    # mark the connection as used
+    def touch(self, con, now):
+        entry = self.items.get(con)
+        if entry is not None:
+            entry.lastseen = now
+            self.items.move_to_end(con)
+        return entry
+
+    # add a new connection (replaces an old one with the same number)
+    def create(self, con, now):
+        entry = Connection()
+        entry.lastseen = now
+        self.items[con] = entry
+        self.items.move_to_end(con)
+        if self.maxsize and len(self.items) > self.maxsize:
+            self.items.popitem(last=False)
+        return entry
+
+    def get_or_create(self, con, now):
+        entry = self.touch(con, now)
+        if entry is None:
+            entry = self.create(con, now)
+        return entry
+
+    # remove closed and inactive connections
+    def sweep(self, now):
+        closed = [con for con, entry in self.items.items()
+                  if entry.closed and entry.closed + CLOSED_CONNECTION_MAX_AGE < now]
+        for con in closed:
+            del self.items[con]
+        while self.items:
+            con, entry = next(iter(self.items.items()))
+            if entry.lastseen + CONNECTION_MAX_AGE >= now:
+                break
+            self.items.popitem(last=False)
+
+    def dump(self):
+        return [[con, entry.dump()] for con, entry in self.items.items()]
+
+    def load(self, data):
+        for con, entry in data:
+            self.items[con] = Connection.load(entry)
+
+
+# store the last successful binds in a sqlite db
+class LastBindStore:
+
+    def __init__(self, path, stage, servername, ttl):
+        self.stage = stage
+        self.servername = servername
+        self.ttl = ttl
+        self.pending = {}
+        self.db = sqlite3.connect(path, timeout=10)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS lastbind ("
+                        "stage TEXT NOT NULL, servername TEXT NOT NULL, user TEXT NOT NULL, "
+                        "bindtime TEXT NOT NULL, updated INTEGER NOT NULL, "
+                        "PRIMARY KEY (stage, servername, user))")
+        self.db.execute("CREATE INDEX IF NOT EXISTS lastbind_updated ON lastbind (updated)")
+        self.db.commit()
+
+    # remember the bind, it is written on the next commit
+    def record(self, user, bindtime, now):
+        self.pending[user] = (bindtime, int(now))
+
+    def commit(self):
+        if not self.pending:
+            return
+        try:
+            self.db.executemany("INSERT OR REPLACE INTO lastbind (stage, servername, user, bindtime, updated) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                [(self.stage, self.servername, user, bindtime, updated)
+                                 for user, (bindtime, updated) in self.pending.items()])
+            self.db.commit()
+            self.pending = {}
+        except sqlite3.Error as e:
+            print("ERROR writing last binds to the sqlite db!")
+            print(e)
+
+    # remove binds older than the ttl
+    def expire(self, now):
+        if not self.ttl:
+            return
+        try:
+            self.db.execute("DELETE FROM lastbind WHERE updated < ?", (int(now) - self.ttl,))
+            self.db.commit()
+        except sqlite3.Error as e:
+            print("ERROR expiring last binds in the sqlite db!")
+            print(e)
+
+    def close(self):
+        self.commit()
+        self.db.close()
+
+
+# output file which is reopened after a logrotate
+class OutputFile:
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = None
+        self.inode = None
+        self.open()
+
+    def open(self):
+        self.handle = open(self.path, "a", encoding="utf-8")
+        self.inode = os.fstat(self.handle.fileno()).st_ino
+
+    def write(self, string):
+        self.handle.write(string)
+
+    def flush(self):
+        self.handle.flush()
+
+    def close(self):
+        self.handle.close()
+
+    # reopen the file if it was moved or removed
+    def check(self, force=False):
+        try:
+            changed = os.stat(self.path).st_ino != self.inode
+        except OSError:
+            changed = True
+        if changed or force:
+            self.close()
+            self.open()
+
+
+# read new lines from the logfile (tail -f)
+class LogTailer:
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = None
+        self.inode = None
+        self.offset = 0
+        self.buffer = b""
+
+    # open the logfile and continue at the given position or start at the end
+    def open(self, position=None, inode=None, fromstart=False):
+        self.handle = open(self.path, "rb")
+        stats = os.fstat(self.handle.fileno())
+        resumed = position is not None and inode == stats.st_ino and position <= stats.st_size
+        if resumed:
+            self.offset = position
+        elif fromstart:
+            self.offset = 0
+        else:
+            self.offset = stats.st_size
+        self.handle.seek(self.offset)
+        self.inode = stats.st_ino
+        self.buffer = b""
+        return resumed
+
+    def close(self):
+        self.handle.close()
+
+    # position of the first not parsed byte
+    def position(self):
+        return self.offset - len(self.buffer)
+
+    # read the next block and return the complete lines (None if there is no new data)
+    def read_lines(self):
+        block = self.handle.read(READ_CHUNK_SIZE)
+        if not block:
+            return None
+        self.offset += len(block)
+        lines = (self.buffer + block).split(b"\n")
+        # keep the last line (maybe incomplete -> next round)
+        self.buffer = lines.pop()
+        return lines
+
+    # check for logrotate: returns "rotated", "truncated" or None
+    def check_rotation(self):
+        try:
+            stats = os.stat(self.path)
+        except OSError:
+            # new logfile does not exist (yet)
+            return None
+        if stats.st_ino != self.inode:
+            return "rotated"
+        if stats.st_size < self.offset:
+            self.handle.seek(0)
+            self.offset = 0
+            self.buffer = b""
+            return "truncated"
+        return None
+
+    # return the last line of a rotated file and open the new file
+    def reopen(self):
+        rest = self.buffer
+        self.close()
+        self.open(fromstart=True)
+        return rest
 
 
 # function to get current time in ldap format
@@ -107,10 +364,16 @@ def get_current_time_ldap():
     return time.strftime("[%d/%b/%Y:%H:%M:%S.000000000 %z]", time.gmtime())
 
 
+# cache for the syslog time (only changes every second)
+__syslogtime = [None, ""]
+
+
 # function the get current time in syslog format
 def get_current_time_syslog():
     # get the current local time
     timenow = time.localtime()
+    if __syslogtime[0] == timenow:
+        return __syslogtime[1]
 
     # get the time offset to send correct syslog time
     daylightsaving = time.daylight and timenow.tm_isdst > 0
@@ -118,103 +381,93 @@ def get_current_time_syslog():
 
     # convert the current time and return it
     date = datetime.datetime.fromtimestamp(time.mktime(timenow))
-    return date.strftime("%Y-%m-%dT%H:%M:%S") + "%+03d:00" % (tzoffset / 60 / 60 * - 1)
+    __syslogtime[0] = timenow
+    __syslogtime[1] = date.strftime("%Y-%m-%dT%H:%M:%S") + "%+03d:00" % (tzoffset / 60 / 60 * - 1)
+    return __syslogtime[1]
 
 
 # translate error code to name
+ERROR_NAMES = {
+    "err=0": "errname=success",
+    "err=1": "errname=operation_error",
+    "err=2": "errname=protocol_error",
+    "err=3": "errname=time_limit_exceeded",
+    "err=4": "errname=size_limit_exceeded",
+    "err=5": "errname=compare_false",
+    "err=6": "errname=compare_true",
+    "err=7": "errname=auth_method_not_supported",
+    "err=8": "errname=strong_auth_required",
+    "err=9": "errname=ldap_partial_results",
+    "err=10": "errname=referral",
+    "err=11": "errname=admin_limit_exceeded",
+    "err=12": "errname=unavailable_critical_extension",
+    "err=13": "errname=confidentiality_required",
+    "err=14": "errname=sasl_bind_in_progress",
+    "err=16": "errname=no_such_attribute",
+    "err=17": "errname=undefined_attribute_type",
+    "err=18": "errname=inappropriate_matching",
+    "err=19": "errname=constraint_violation",
+    "err=20": "errname=attribute_or_value_exists",
+    "err=21": "errname=invalid_attribute_syntax",
+    "err=32": "errname=no_such_object",
+    "err=33": "errname=alias_problem",
+    "err=34": "errname=invalid_dn_syntax",
+    "err=35": "errname=is_leaf",
+    "err=36": "errname=alias_dereferencing_problem",
+    "err=48": "errname=inappropriate_authentication",
+    "err=49": "errname=invalid_credentials",
+    "err=50": "errname=insufficient_access_rights",
+    "err=51": "errname=busy",
+    "err=52": "errname=unavailable",
+    "err=53": "errname=unwilling_to_perform",
+    "err=54": "errname=loop_defect",
+    "err=64": "errname=naming_violation",
+    "err=65": "errname=object_class_violation",
+    "err=66": "errname=not_allowed_on_nonleaf",
+    "err=67": "errname=not_allowed_on_rdn",
+    "err=68": "errname=entry_already_exists",
+    "err=69": "errname=object_class_mods_prohibited",
+    "err=71": "errname=affects_multiple_dsas",
+    "err=80": "errname=other",
+    "err=81": "errname=server_down",
+    "err=85": "errname=ldap_timeout",
+    "err=89": "errname=param_error",
+    "err=91": "errname=connect_error",
+    "err=92": "errname=ldap_not_supported",
+    "err=93": "errname=control_not_found",
+    "err=94": "errname=no_results_returned",
+    "err=95": "errname=more_results_to_return",
+    "err=96": "errname=client_loop",
+    "err=97": "errname=referral_limit_exceeded"
+}
+
+
 def get_error_code_by_name(reserr):
-    errortranslate = {
-        "err=0": "errname=success",
-        "err=1": "errname=operation_error",
-        "err=2": "errname=protocol_error",
-        "err=3": "errname=time_limit_exceeded",
-        "err=4": "errname=size_limit_exceeded",
-        "err=5": "errname=compare_false",
-        "err=6": "errname=compare_true",
-        "err=7": "errname=auth_method_not_supported",
-        "err=8": "errname=strong_auth_required",
-        "err=9": "errname=ldap_partial_results",
-        "err=10": "errname=referral",
-        "err=11": "errname=admin_limit_exceeded",
-        "err=12": "errname=unavailable_critical_extension",
-        "err=13": "errname=confidentiality_required",
-        "err=14": "errname=sasl_bind_in_progress",
-        "err=16": "errname=no_such_attribute",
-        "err=17": "errname=undefined_attribute_type",
-        "err=18": "errname=inappropriate_matching",
-        "err=19": "errname=constraint_violation",
-        "err=20": "errname=attribute_or_value_exists",
-        "err=21": "errname=invalid_attribute_syntax",
-        "err=32": "errname=no_such_object",
-        "err=33": "errname=alias_problem",
-        "err=34": "errname=invalid_dn_syntax",
-        "err=35": "errname=is_leaf",
-        "err=36": "errname=alias_dereferencing_problem",
-        "err=48": "errname=inappropriate_authentication",
-        "err=49": "errname=invalid_credentials",
-        "err=50": "errname=insufficient_access_rights",
-        "err=51": "errname=busy",
-        "err=52": "errname=unavailable",
-        "err=53": "errname=unwilling_to_perform",
-        "err=54": "errname=loop_defect",
-        "err=64": "errname=naming_violation",
-        "err=65": "errname=object_class_violation",
-        "err=66": "errname=not_allowed_on_nonleaf",
-        "err=67": "errname=not_allowed_on_rdn",
-        "err=68": "errname=entry_already_exists",
-        "err=69": "errname=object_class_mods_prohibited",
-        "err=71": "errname=affects_multiple_dsas",
-        "err=80": "errname=other",
-        "err=81": "errname=server_down",
-        "err=85": "errname=ldap_timeout",
-        "err=89": "errname=param_error",
-        "err=91": "errname=connect_error",
-        "err=92": "errname=ldap_not_supported",
-        "err=93": "errname=control_not_found",
-        "err=94": "errname=no_results_returned",
-        "err=95": "errname=more_results_to_return",
-        "err=96": "errname=client_loop",
-        "err=97": "errname=referral_limit_exceeded"
-    }
-    return errortranslate[reserr]
+    return ERROR_NAMES.get(reserr, "errname=unknown")
 
 
-# store the last successful bind into the redis
-def record_last_success_bind(servername, user, time):
+# store the last successful bind into the sqlite db and the lastbind logfile
+def record_last_success_bind(servername, user, bindtime):
     # try to parse tle line
     try:
-        # get the global redis connection
-        global __redislastbind
-        try:
-            __redislastbind.ping()
-        except:
-            global __stage
-            __redislastbind = redis_open_connection(__stage, "lastbind")
-
-        # insert new connection to redis db
-        __redislastbind.set(user, time)
-        __redislastbind.expire(user, 93600)  # expire in 26h
+        # insert new bind into the sqlite db
+        if __lastbindstore is not None:
+            __lastbindstore.record(user, bindtime, now())
 
         # create line to record
         logline = "%s INFO: %s - RECORD - Success Bind from \"%s\" at \"%s\" on server \"%s\"" % \
-                  (get_current_time_syslog(), servername[0], user, time, servername)
+                  (get_current_time_syslog(), servername, user, bindtime, servername)
 
         # append info to the lastbind logfile
         try:
-
-            # append to lastbind file
-            global __outlastbindfile
-            if __outlastbindfile:
-                outlastbindfile = open(__outlastbindfile, "a+")
-                outlastbindfile.write("%s %s\n" % (get_current_time_syslog(), logline))
-                outlastbindfile.flush()
-                outlastbindfile.close()
+            if __outlastbindwriter is not None:
+                __outlastbindwriter.write("%s %s\n" % (get_current_time_syslog(), logline))
         except Exception as e:
             print("ERROR writing local lastbind line! (%s)" % logline)
             print(e)
 
     except Exception as e:
-        print("ERROR on record_last_success_bind function! (%s %s %s)" % (servername, user, time))
+        print("ERROR on record_last_success_bind function! (%s %s %s)" % (servername, user, bindtime))
         print(e)
 
 
@@ -247,30 +500,28 @@ def send_syslog_message(string, servername):
 
 
 # write the logline to a local file
-def write_local_logfile(string, logfile):
+def write_local_logfile(string):
     try:
         # direct write to logfile to avoid journald
-        global __outlogfile
-        if __outlogfile:
-            logfile.write("%s %s\n" % (get_current_time_syslog(), string))
+        if __outlogwriter is not None:
+            __outlogwriter.write("%s %s\n" % (get_current_time_syslog(), string))
 
     except Exception as e:
-        print("ERROR writing local syslog line to file! (%s - %s)" % (logfile, string))
+        print("ERROR writing local syslog line to file! (%s - %s)" % (__outlogfile, string))
         print(e)
 
 
 # log a connection
-def log_line(servername, line, logfile):
+def log_line(servername, line):
     try:
         # build the string with all possible options
         string = ("%s %s" % (servername, line))
 
         # write log to syslog and local file
         send_syslog_message(string, servername)
-        write_local_logfile(string, logfile)
+        write_local_logfile(string)
 
         # write to stdout if defined
-        global __stdout
         if __stdout:
             print(string)
 
@@ -280,14 +531,14 @@ def log_line(servername, line, logfile):
 
 
 # log a error
-def log_error(source, servername, line, error, logfile):
+def log_error(source, servername, line, error):
     try:
         # show the original line as error string
         string = str("%s %s conn=-1 %s %s" % (servername, get_current_time_ldap(), error, line.rstrip()))
 
         # write log to syslog and local file
         send_syslog_message(string, servername)
-        write_local_logfile(string, logfile)
+        write_local_logfile(string)
 
         # on error always write to stdout
         print("%s: %s" % (source, string))
@@ -297,149 +548,113 @@ def log_error(source, servername, line, error, logfile):
         print(e)
 
 
-# create entry for new connection in the redis
-def new_connection(servername, con, conhash, line, redislogs, logfile):
+# current time for the connection ages
+def now():
+    return time.time()
+
+
+# create entry for new connection
+def new_connection(servername, con, line):
     # time for later los usage
     linetime = "%s]" % line.split('] ')[0]
 
-    # prepare line to be added to redis
-    line = line.replace(('%s ' % con), '')
+    # prepare the connection info
+    line = line.replace(('%s ' % con), '', 1)
     line = line.replace('SSL connection', 'tls=true starttls=false port=636')
     line = line.replace('connection', 'tls=false starttls=false port=389')
     line = line.replace('from ', 'from=')
     line = line.replace('to ', 'to=')
     line = line.split('] ')[-1]
-    line = "CONNECTION connectioninfo=true %s autobind=false binddn=none" % line
 
-    # insert information into redis
-    try:
-        redislogs.hset(str(conhash), "connection", line)
-    except Exception as a:
-        log_error("new_connection", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # store the connection info (replaces an old connection with the same number)
+    entry = __connections.create(con, now())
+    entry.info = True
+    entry.autobind = "autobind=false"
+    match = CONNECTION_PATTERN.match(line)
+    if match:
+        entry.prefix, entry.tls, entry.suffix = match.group(1, 2, 3)
+    else:
+        # unknown format, keep the line as it is
+        entry.prefix = line
+        entry.tls = None
 
     # generate the logline
-    logline = str("%s %s op=-1 OPEN type=open RESULT err=0 errname=success %s" % (linetime, con, line))
+    logline = str("%s %s op=-1 OPEN type=open RESULT err=0 errname=success %s" % (linetime, con, entry.render()))
 
     # send the logline
-    log_line(servername, logline, logfile)
+    log_line(servername, logline)
 
 
 # update connection information for starttls
-def update_connection_tls(servername, con, conhash, line, redislogs, logfile):
+def update_connection_tls(servername, con, line):
     # prepare the tls info
-    tlsinfo = line.replace(('%s ' % con), '')
+    tlsinfo = line.replace(('%s ' % con), '', 1)
     tlsinfo = tlsinfo.split('] ')[-1]
     tlsinfo = tlsinfo.replace(' ', ',')
-    tlsinfo = "starttls=\"%s\"" % tlsinfo
 
-    # append info to redis entry
-    try:
-        try:
-            # get the connection information from redis
-            entry = redislogs.hget(str(conhash), "connection")
-            entry = entry.decode()
-            entry = entry.replace('tls=false', 'tls=true')
-            entry = entry.replace('starttls=false', ('starttls=%s' % tlsinfo))
-            # replace updated entry in the redis
-            redislogs.hset(str(conhash), "connection", entry)
-        except:
-            # add new entry to redis and add information for missing fields
-            entry = "connectioninfo=false fd=0 slot=0 tls=true %s port=0 from=0.0.0.0 to=0.0.0.0 autobind=none binddn=none" % (tlsinfo)
-            redislogs.hset(str(conhash), "connection", entry)
-    except Exception as a:
-        log_error("update_connection_tls", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # an ssl connection (port 636) is already encrypted, only plain connections use starttls
+    entry = __connections.get_or_create(con, now())
+    if entry.tls == "false":
+        entry.tls = "true"
+        entry.starttls = "\"%s\"" % tlsinfo
 
 
 # update connection information for autobind user
-def update_connection_autobind(servername, con, conhash, line, redislogs, logfile):
-    # prepare the tls info
-    line = line.replace(('%s ' % con), '')
+def update_connection_autobind(servername, con, line):
+    # prepare the autobind info
+    line = line.replace(('%s ' % con), '', 1)
     line = line.replace('AUTOBIND dn=', 'autobind=')
     line = line.split('] ')[-1]
 
-    # append info to redis entry
-    try:
-        try:
-            # get the connection information from redis
-            entry = redislogs.hget(str(conhash), "connection")
-            entry = entry.decode()
-            entry = entry.replace('autobind=false', line)
-            # replace updated entry in the redis
-            redislogs.hset(str(conhash), "connection", entry)
-        except:
-            # add new entry to redis and add information for missing fields
-            entry = "connectioninfo=false fd=0 slot=0 tls=false starttls=false port=0 from=0.0.0.0 to=0.0.0.0 %s binddn=none" % (line)
-            redislogs.hset(str(conhash), "connection", entry)
-    except Exception as a:
-        log_error("update_connection_autobind", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # only the first autobind is stored
+    entry = __connections.get_or_create(con, now())
+    if entry.autobind in ("autobind=false", "autobind=none"):
+        entry.autobind = line
 
 
 # update connection information for bind user
-def update_connection_bind(servername, con, conhash, opnumber, line, redislogs, logfile):
-    # prepare the tls info
-    line = line.replace(('%s ' % con), '')
-    line = line.replace('BIND dn=', 'binddn=')
-    line = line.replace(('%s ' % opnumber), '')
+def update_connection_bind(servername, con, opnumber, line):
+    # prepare the bind info
+    line = line.replace(('%s ' % con), '', 1)
+    line = line.replace('BIND dn=', 'binddn=', 1)
+    line = line.replace(('%s ' % opnumber), '', 1)
     line = line.split('] ')[-1]
 
-    # append info to redis entry
-    try:
-        try:
-            # get the connection information from redis
-            entry = redislogs.hget(str(conhash), "connection")
-            entry = entry.decode()
-            entry = entry.replace('binddn=none', line)
-            # replace updated entry in the redis
-            redislogs.hset(str(conhash), "connection", entry)
-        except:
-            # add new entry to redis and add information for missing fields
-            entry = "connectioninfo=false fd=0 slot=0 tls=false starttls=false port=0 from=0.0.0.0 to=0.0.0.0 autobind=none %s" % (line)
-            redislogs.hset(str(conhash), "connection", entry)
-    except Exception as a:
-        log_error("update_connection_bind", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # only the first bind is stored
+    entry = __connections.get_or_create(con, now())
+    if entry.binddn == "binddn=none":
+        entry.binddn = line
 
 
-# write the current operation into the redis
-def new_operation(servername, conhash, opnumber, operation, line, redislogs, logfile):
+# store the current operation
+def new_operation(servername, con, opnumber, operation, line):
     # prepare the line
-    line = line.replace(('%s' % operation), ('%s type=\"%s\"' % (operation, operation.lower())))
+    line = line.replace(('%s %s' % (opnumber, operation)),
+                        ('%s %s type=\"%s\"' % (opnumber, operation, operation.lower())), 1)
 
-    # add the line to the redis
-    try:
-        # replace updated entry in the redis
-        redislogs.hset(str(conhash), opnumber, line)
-    except Exception as a:
-        log_error("new_operation", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # add the line to the connection
+    __connections.get_or_create(con, now()).ops[opnumber] = line
 
 
-# log result with operation and connection data from redis
-def log_operation(servername, con, conhash, opnumber, errorcode, line, redislogs, logfile):
-    # prepare the tls info
-    line = line.replace(('%s ' % con), '')
-    line = line.replace(('%s ' % opnumber), '')
-    line = line.replace(('%s ' % errorcode), ('%s %s ' % (errorcode, get_error_code_by_name(errorcode))))
+# log result with operation and connection data
+def log_operation(servername, con, opnumber, errorcode, line):
+    # prepare the result info
+    line = line.replace(('%s ' % con), '', 1)
+    line = line.replace(('%s ' % opnumber), '', 1)
+    line = line.replace(('%s ' % errorcode), ('%s %s ' % (errorcode, get_error_code_by_name(errorcode))), 1)
     line = line.split('] ')[-1]
 
-    # get infos from redis
-    redisconnection = ""
-    redisoperation = ""
-    try:
-        # get the connection information from redis
-        redisconnection = redislogs.hget(str(conhash), "connection")
-        if redisconnection is None:
-            redisconnection = "CONNECTION connectioninfo=false fd=0 slot=0 tls=false starttls=false port=0 from=0.0.0.0 to=0.0.0.0 autobind=none binddn=none"
-        else:
-            redisconnection = redisconnection.decode()
-
-        # get the operation information from redis
-        redisoperation = redislogs.hget(str(conhash), str(opnumber))
-        if redisoperation is None:
-            redisoperation = "%s %s %s UNKNOWN(Operation not found in redis!) operationmissing=true" % \
-                             (get_current_time_ldap(), con, opnumber)
-        else:
-            redisoperation = redisoperation.decode()
-    except Exception as a:
-        log_error("log_operation", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # get the connection and operation information (operation is removed)
+    entry = __connections.get(con)
+    operation = None
+    if entry is None:
+        connection = "CONNECTION %s" % EMPTY_CONNECTION_INFO
+    else:
+        connection = entry.render()
+        operation = entry.ops.pop(opnumber, None)
+    if operation is None:
+        operation = "%s %s %s UNKNOWN(Operation not found in redis!) operationmissing=true" % \
+                    (get_current_time_ldap(), con, opnumber)
 
     # check if it was the result of a successfull bind
     try:
@@ -447,67 +662,49 @@ def log_operation(servername, con, conhash, opnumber, errorcode, line, redislogs
             # extract the needed values from the strings
             user = line.split(' dn=')[-1]
             user = user.replace('"', '')
-            time = "%s]" % redisoperation.split('] ')[0]
-            # insert the bind into the redis
-            record_last_success_bind(servername, user, time)
+            bindtime = "%s]" % operation.split('] ')[0]
+            # record the bind
+            record_last_success_bind(servername, user, bindtime)
     except Exception as a:
-        log_error("log_operation_lastbind", servername, line, ("ERROR(%s)" % str(a)), logfile)
+        log_error("log_operation_lastbind", servername, line, ("ERROR(%s)" % str(a)))
 
     # generate the logline
-    logline = str("%s %s %s" % (redisoperation, line, redisconnection))
+    logline = str("%s %s %s" % (operation, line, connection))
 
     # send the logline
-    log_line(servername, logline, logfile)
-
-    # clean up opnumber in redis
-    try:
-        redislogs.hdel(str(conhash), str(opnumber))
-    except:
-        pass
+    log_line(servername, logline)
 
 
 # log the closing connection
-def close_connection(servername, conhash, opnumber, fdnumber, line, redislogs, logfile):
+def close_connection(servername, con, opnumber, fdnumber, line):
     # prepare the additional info
     closeinfo = line.split("%s " % fdnumber)[-1]
     closeinfo = closeinfo.replace(' - ', '=')
     closeinfo = closeinfo.replace(' ', '_')
 
-    # get infos from redis
-    redisconnection = ""
-    redisoperation = ""
-    try:
-        # get the connection information from redis
-        redisconnection = redislogs.hget(str(conhash), "connection")
-        if redisconnection is None:
-            redisconnection = "CONNECTION %s connectioninfo=false fd=0 slot=0 tls=false starttls=false port=0 from=0.0.0.0 to=0.0.0.0 autobind=none binddn=none" % fdnumber
-        else:
-            redisconnection = redisconnection.decode()
-
-        # get the operation information from redis
-        redisoperation = redislogs.hget(str(conhash), str(opnumber))
-        if redisoperation is None or opnumber == "op=-1":
-            redisoperation = "%s CLOSE type=\"close\" note=\"close without unbind\"" % (line.split(" %s" % fdnumber)[0])
-        else:
-            redisoperation = redisoperation.decode()
-    except Exception as a:
-        log_error("close_connection", servername, line, ("ERROR(%s)" % str(a)), logfile)
+    # get the connection and operation information
+    entry = __connections.get(con)
+    operation = None
+    if entry is None:
+        connection = "CONNECTION %s %s" % (fdnumber, EMPTY_CONNECTION_INFO)
+    else:
+        connection = entry.render()
+        if opnumber != "op=-1":
+            operation = entry.ops.pop(opnumber, None)
+        # mark entry for deletion in 5min
+        entry.closed = now()
+    if operation is None:
+        operation = "%s CLOSE type=\"close\" note=\"close without unbind\"" % (line.split(" %s" % fdnumber)[0])
 
     # generate the logline
-    logline = str("%s RESULT err=0 errname=success %s %s" % (redisoperation, closeinfo, redisconnection))
+    logline = str("%s RESULT err=0 errname=success %s %s" % (operation, closeinfo, connection))
 
     # send the logline
-    log_line(servername, logline, logfile)
-
-    # mark entry deletion in redis in 5min = 300
-    try:
-        redislogs.expire(str(conhash), 300)
-    except:
-        pass
+    log_line(servername, logline)
 
 
 # parse the given logline
-def parse_current_log_line(servername, line, logfile):
+def parse_current_log_line(servername, line):
     try:
         # skip empty lines
         if not line.strip():
@@ -527,169 +724,263 @@ def parse_current_log_line(servername, line, logfile):
 
     # try to parse tle line
     try:
-        # split the line to usable args
-        args = shlex.split(line)
+        # split the line to usable args (only the first fields are needed)
+        # [time, timezone], conn, op/fd/TLS/AUTOBIND, operation, errorcode
+        args = line.split(None, 6)
 
         # get infos about the current line
-        con = str(args[2])
-        conhash = ("%s:%s" % (servername, con))
-        opnumber = str(args[3])
+        con = args[2]
+        opnumber = args[3]
 
-        # get the global redis connection
-        global __redislogs
-        try:
-            __redislogs.ping()
-        except:
-            global __stage
-            __redislogs = redis_open_connection(__stage, "logs")
-
-        # if there is no redis object create one with max age in seconds
-        # 1h ... 3600, 6h ... 21600, 12h ... 43200, 24h ... 86400
-        try:
-            __redislogs.expire(str(conhash), 86400)
-        except:
-            pass
+        # mark the connection as active
+        __connections.touch(con, now())
 
         # check the next step for the logline
         if opnumber.startswith("op="):
             # get the operation from the line
-            operation = str(args[4])
+            operation = args[4]
             if operation == "RESULT":
                 # get the error code from the line
-                errorcode = str(args[5])
+                errorcode = args[5]
                 # result should send a logine
-                log_operation(servername, con, conhash, opnumber, errorcode, line, __redislogs, logfile)
+                log_operation(servername, con, opnumber, errorcode, line)
             elif operation == "BIND":
-                # bind user should be stored to redis as soon as possible
-                update_connection_bind(servername, con, conhash, opnumber, line, __redislogs, logfile)
-                # also log this line to redis db
-                new_operation(servername, conhash, opnumber, operation, line, __redislogs, logfile)
+                # bind user should be stored as soon as possible
+                update_connection_bind(servername, con, opnumber, line)
+                # also store the operation
+                new_operation(servername, con, opnumber, operation, line)
             elif operation.startswith("fd="):
                 # send log line on connection close
-                close_connection(servername, conhash, opnumber, operation, line, __redislogs, logfile)
+                close_connection(servername, con, opnumber, operation, line)
             else:
-                # normal operation should be stored to redis
-                new_operation(servername, conhash, opnumber, operation, line, __redislogs, logfile)
+                # normal operation should be stored
+                new_operation(servername, con, opnumber, operation, line)
         elif opnumber.startswith("fd="):
             # log new connection
-            new_connection(servername, con, conhash, line, __redislogs, logfile)
+            new_connection(servername, con, line)
         elif opnumber.startswith("TLS"):
             # update connection status to starttls
-            update_connection_tls(servername, con, conhash, line, __redislogs, logfile)
+            update_connection_tls(servername, con, line)
         elif opnumber.startswith("AUTOBIND"):
             # update connection to show autobind usage
-            update_connection_autobind(servername, con, conhash, line, __redislogs, logfile)
+            update_connection_autobind(servername, con, line)
         else:
             # unknown line should be logged with information about that
-            log_error("parse_current_log_line", servername, line.encode(), "UNKNOWN(TYPE OF LOG LINE!)", logfile)
+            log_error("parse_current_log_line", servername, line, "UNKNOWN(TYPE OF LOG LINE!)")
 
     except Exception as e:
         # log the wrong line
-        log_error("parse_current_log_line", servername, line.encode(), ("ERROR(%s)" % str(e)), logfile)
+        log_error("parse_current_log_line", servername, line, ("ERROR(%s)" % str(e)))
+
+
+# load the state of the last run (None if there is no usable state)
+def load_state(logfile):
+    if not __statefile or not os.path.exists(__statefile):
+        return None
+    try:
+        with open(__statefile, "r", encoding="utf-8") as statefile:
+            state = json.load(statefile)
+        if state.get("version") != 1 or state.get("logfile") != os.path.abspath(logfile):
+            print("IGNORING STATE FILE (%s): other version or logfile" % __statefile)
+            return None
+        return state
+    except Exception as e:
+        print("ERROR reading the state file (%s)! ... Starting without state" % __statefile)
+        print(e)
+        return None
+
+
+# save the current state (atomic replace of the state file)
+def save_state(logfile, tailer):
+    if not __statefile:
+        return
+    try:
+        state = {
+            "version": 1,
+            "logfile": os.path.abspath(logfile),
+            "inode": tailer.inode,
+            "position": tailer.position(),
+            "saved": now(),
+            "connections": __connections.dump()
+        }
+        tmpfile = "%s.tmp" % __statefile
+        with open(tmpfile, "w", encoding="utf-8") as statefile:
+            json.dump(state, statefile, separators=(",", ":"))
+            statefile.flush()
+            os.fsync(statefile.fileno())
+        os.replace(tmpfile, __statefile)
+    except Exception as e:
+        print("ERROR writing the state file (%s)!" % __statefile)
+        print(e)
+
+
+# open the output files and the sqlite db
+def open_outputs():
+    global __outlogwriter
+    global __outlastbindwriter
+    global __lastbindstore
+    if __outlogfile:
+        __outlogwriter = OutputFile(__outlogfile)
+    if __outlastbindfile:
+        __outlastbindwriter = OutputFile(__outlastbindfile)
+    if __lastbinddb:
+        __lastbindstore = LastBindStore(__lastbinddb, __stage, __servername, __lastbindttl)
+
+
+# flush all outputs and reopen moved output files
+def flush_outputs(reopen=False):
+    for writer in (__outlogwriter, __outlastbindwriter):
+        if writer is None:
+            continue
+        try:
+            writer.flush()
+            writer.check(force=reopen)
+        except Exception as e:
+            print("ERROR writing or reopening the output file (%s)!" % writer.path)
+            print(e)
+    if __lastbindstore is not None:
+        __lastbindstore.commit()
+    sys.stdout.flush()
+
+
+# close all outputs
+def close_outputs():
+    flush_outputs()
+    for writer in (__outlogwriter, __outlastbindwriter):
+        if writer is not None:
+            writer.close()
+    if __lastbindstore is not None:
+        __lastbindstore.close()
+
+
+# parse all given lines
+def parse_lines(servername, lines):
+    for logline in lines:
+        parse_current_log_line(servername, logline.decode("utf-8", "replace"))
 
 
 # funktion for tailing the logfile
 def file_seeker_loop(servername, logfile, killer):
-    # start reading line (tail -f) from the initial position
-    position = 0
-    while True:
-        # stop application if there is the signal
-        if killer.kill_now:
-            break
+    global __connections
+    __connections = ConnectionStore(__maxconnections)
 
-        # try to open logfile and read the lines
-        global __outlogfile
+    # restore the state of the last run
+    state = load_state(logfile)
+    if state is not None:
+        __connections.load(state.get("connections", []))
+        __connections.sweep(now())
+
+    # open the input logfile and the outputs
+    tailer = LogTailer(logfile)
+    try:
+        if state is None:
+            tailer.open()
+        elif tailer.open(state.get("position"), state.get("inode")):
+            print("CONTINUE READING (%s) at position %s" % (logfile, tailer.position()))
+        open_outputs()
+    except Exception as ae:
+        print("ERROR reading or writing the logs files (IN=%s, OUT=%s)! ... Exiting" % (logfile, str(__outlogfile)))
+        print(ae)
+        sys.exit(1)
+
+    # times for the periodic tasks
+    nextflush = now() + FLUSH_INTERVAL
+    nextsweep = now() + SWEEP_INTERVAL
+    nextsnapshot = now() + SNAPSHOT_INTERVAL
+
+    while not killer.kill_now:
+        # read and parse the next lines
+        lines = None
         try:
-            # open the source logfile
-            filereader = open(logfile, 'r')
-            # open the destination logfile
-            if __outlogfile:
-                outlogfile = open(__outlogfile, "a+")
+            lines = tailer.read_lines()
+            if lines is not None:
+                parse_lines(servername, lines)
             else:
-                outlogfile = None
-
-            # read the next lines in the file
-            try:
-                # get current filesize
-                filereader.seek(0, 2)
-                currentsize = filereader.tell()
-
-                # on start set position to currentsize
-                if position == 0:
-                    position = currentsize
-                # on logrotate start from beginning
-                if position > currentsize:
-                    position = 0
-
-                # read the data starting from the position
-                filereader.seek(position, 0)
-                logblock = filereader.read()
-
-                # get the position of the last linebreak and skip last line (maybe incomplete -> next round)
-                lastlinebreak = logblock.rfind("\n")
-
-                # continue if there is a linebreak
-                if lastlinebreak > 0:
-
-                    # read data only to last linebreak
-                    logblock = logblock[0:lastlinebreak]
-                    for logline in logblock.splitlines():
-
-                        # parse the logline
-                        parse_current_log_line(servername, logline, outlogfile)
-
-                    # save position of last linebreak
-                    position = position + lastlinebreak
-
-            except Exception as ae:
-                print("ERROR reading new data from the logfile (%s)!" % logfile)
-                print(ae)
-
-            # close the filereader
-            filereader.close()
-
-            # flush and close the filewriter
-            if __outlogfile:
-                outlogfile.flush()
-                outlogfile.close()
+                # no new data, check for logrotate
+                rotation = tailer.check_rotation()
+                if rotation == "rotated":
+                    # read the rest of the old file before switching to the new one
+                    lines = tailer.read_lines()
+                    while lines is not None:
+                        parse_lines(servername, lines)
+                        lines = tailer.read_lines()
+                    parse_lines(servername, [tailer.reopen()])
+                elif rotation == "truncated":
+                    print("LOGFILE TRUNCATED (%s) ... starting from beginning" % logfile)
         except Exception as ae:
-            print("ERROR reading or writing the logs files (IN=%s, OUT=%s)! ... Exiting" % (logfile, str(__outlogfile)))
+            print("ERROR reading new data from the logfile (%s)!" % logfile)
             print(ae)
-            sys.exit(1)
 
-        # stop application if there is the signal
-        if killer.kill_now:
-            break
+        # periodic tasks
+        currenttime = now()
+        if lines is None or currenttime >= nextflush or killer.reopen:
+            flush_outputs(reopen=killer.reopen)
+            killer.reopen = False
+            nextflush = currenttime + FLUSH_INTERVAL
+        if currenttime >= nextsweep:
+            __connections.sweep(currenttime)
+            if __lastbindstore is not None:
+                __lastbindstore.expire(currenttime)
+            nextsweep = currenttime + SWEEP_INTERVAL
+        if currenttime >= nextsnapshot:
+            save_state(logfile, tailer)
+            nextsnapshot = currenttime + SNAPSHOT_INTERVAL
 
         # sleep some time before next read
-        time.sleep(0.1)
+        if lines is None and not killer.kill_now:
+            time.sleep(0.1)
+
+    # save the state and close everything
+    save_state(logfile, tailer)
+    close_outputs()
+    tailer.close()
 
 
 # help function for script execution
 def show_help():
     global __servername
-    print(""
-          "There are needed params missing!"
-          "Use: <script> <params>"
-          ""
-          "Possible params:"
-          "-i | --log_input     ... Input log file from 389-ds (needed)"
-          "-o | --log_output    ... Output log file for combined log (default: False)"
-          "-l | --log_lastbind  ... Logfile for last successful binds (default: False)"
-          "-s | --servername    ... Name of the server for the log lines (default: %s)"
-          "-e | --stage         ... Define the server environment p, v or d (default: p ... production)"
-          "-d | --syslog_host   ... Destination server for the syslog message (default: 127.0.0.1)"
-          "-p | --syslog_port   ... Destination port for the syslog message (default: 514)"
-          "-v | --syslog_value  ... Facility and level for the syslog message (default: 165)"
-          "-t | --stdout        ... Display combined log on stdout (default: True)"
-          "-h | --help          ... This message :)"
-          ""
-          "To disable a output function use:"
-          "--log_output=False    ... Write no combined logfile"
-          "--log_lastbind=False  ... Write no lastbind logfile"
-          "--syslog_host=False   ... Do not send a syslog message"
-          "" % __servername)
+    print("There are needed params missing!\n"
+          "Use: <script> <params>\n"
+          "\n"
+          "Possible params:\n"
+          "-i | --log_input       ... Input log file from 389-ds (needed)\n"
+          "-o | --log_output      ... Output log file for combined log (default: False)\n"
+          "-l | --log_lastbind    ... Logfile for last successful binds (default: False)\n"
+          "-b | --lastbind_db     ... SQLite db for last successful binds (default: False)\n"
+          "     --lastbind_ttl    ... Seconds to keep binds in the SQLite db, 0 = forever (default: 93600)\n"
+          "-f | --state_file      ... File to save the state on stop and continue on start (default: False)\n"
+          "     --max_connections ... Max number of connections kept in memory, 0 = unlimited (default: 100000)\n"
+          "-s | --servername      ... Name of the server for the log lines (default: %s)\n"
+          "-e | --stage           ... Define the server environment p, v or d (default: p ... production)\n"
+          "-d | --syslog_host     ... Destination server for the syslog message (default: 127.0.0.1)\n"
+          "-p | --syslog_port     ... Destination port for the syslog message (default: 514)\n"
+          "-v | --syslog_value    ... Facility and level for the syslog message (default: 165)\n"
+          "-t | --stdout          ... Display combined log on stdout (default: True)\n"
+          "-h | --help            ... This message :)\n"
+          "\n"
+          "To disable a output function use:\n"
+          "--log_output=False    ... Write no combined logfile\n"
+          "--log_lastbind=False  ... Write no lastbind logfile\n"
+          "--syslog_host=False   ... Do not send a syslog message\n"
+          "--stdout=False        ... Do not write to stdout\n"
+          "\n"
+          "Send SIGHUP to reopen the output files after a logrotate.\n" % __servername)
     sys.exit(1)
+
+
+# convert the param to a file name or False
+def file_param(arg):
+    if arg == "False" or arg == "None":
+        return False
+    return arg
+
+
+# convert the param to a number or show the help
+def int_param(arg):
+    try:
+        return int(arg)
+    except ValueError:
+        show_help()
 
 
 # define the main funktion
@@ -706,9 +997,11 @@ def main(argv):
 
     # read the given option
     try:
-        opts, args = getopt.getopt(argv, "i:o:l:s:e:d:p:v:t:h", ["log_input=", "log_output=", "log_lastbind=",
-                                                                 "servername=", "stage=", "syslog_host=",
-                                                                 "syslog_port=", "syslog_value=", "stdout=", "help="])
+        opts, args = getopt.getopt(argv, "i:o:l:b:f:s:e:d:p:v:t:h", ["log_input=", "log_output=", "log_lastbind=",
+                                                                     "lastbind_db=", "lastbind_ttl=", "state_file=",
+                                                                     "max_connections=", "servername=", "stage=",
+                                                                     "syslog_host=", "syslog_port=", "syslog_value=",
+                                                                     "stdout=", "help"])
     except:
         show_help()
         sys.exit(1)
@@ -720,16 +1013,22 @@ def main(argv):
             __inlogfile = arg
         if opt in ("-o", "--log_output"):
             global __outlogfile
-            if arg == "False" or arg == "None":
-                __outlogfile = False
-            else:
-                __outlogfile = arg
+            __outlogfile = file_param(arg)
         if opt in ("-l", "--log_lastbind"):
             global __outlastbindfile
-            if arg == "False" or arg == "None":
-                __outlastbindfile = False
-            else:
-                __outlastbindfile = arg
+            __outlastbindfile = file_param(arg)
+        if opt in ("-b", "--lastbind_db"):
+            global __lastbinddb
+            __lastbinddb = file_param(arg)
+        if opt == "--lastbind_ttl":
+            global __lastbindttl
+            __lastbindttl = int_param(arg)
+        if opt in ("-f", "--state_file"):
+            global __statefile
+            __statefile = file_param(arg)
+        if opt == "--max_connections":
+            global __maxconnections
+            __maxconnections = int_param(arg)
         if opt in ("-s", "--servername"):
             __servername = arg
         if opt in ("-e", "--stage"):
@@ -740,20 +1039,19 @@ def main(argv):
                 show_help()
         if opt in ("-d", "--syslog_host"):
             global __sysloghost
-            if arg == "False" or arg == "None":
-                __sysloghost = False
-            else:
-                __sysloghost = arg
+            __sysloghost = file_param(arg)
         if opt in ("-p", "--syslog_port"):
             global __syslogport
-            __syslogport = arg
+            __syslogport = int_param(arg)
         if opt in ("-v", "--syslog_value"):
             global __syslogvalue
-            __syslogvalue = arg
+            __syslogvalue = int_param(arg)
         if opt in ("-t", "--stdout"):
-            if opt == "False" or "false":
-                global __stdout
+            global __stdout
+            if arg in ("False", "false"):
                 __stdout = False
+            elif arg in ("True", "true"):
+                __stdout = True
             else:
                 show_help()
         if opt in ("-h", "--help"):

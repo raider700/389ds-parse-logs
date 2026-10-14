@@ -7,42 +7,49 @@ It is also working with RedHat Directory Server 11 (389-ds-base-1.4.3.22).
 ## Installation
 
 There is no installation needed, you only have to start the script.
-But before check the following dependencies:
-* Local installed redis (localhost) on default port (6379)
-* Installed python3 with following modules:
-  * sys
-  * getopt
-  * redis
-  * shlex
-  * time
-  * datetime
-  * signal
-  * socket
+Only python3 (>= 3.6) with its standard library is needed (no redis or other external modules).
 
-Important:
-Script was only tested against python 3.6
+The state of the open connections is kept in the memory of the process:
+* Closed connections are removed after 5 minutes, inactive connections after 24 hours.
+* `--max_connections` limits the number of connections kept in memory (oldest inactive are removed first).
+* With `--state_file` the state and the read position are saved on stop (and every 5 minutes).
+  On the next start the script continues at the saved position, so no lines get lost on a restart.
+  If the logfile was rotated in the meantime, the script starts at the end of the new file.
+
+Last successful binds can be stored in a SQLite db with `--lastbind_db` (table `lastbind`
+with the columns `stage`, `servername`, `user`, `bindtime`, `updated`). The db uses WAL mode,
+so it can be read by other tools while the script is running, e.g.:
+```bash
+sqlite3 /var/lib/parse-logs/lastbind.db "SELECT user, bindtime FROM lastbind ORDER BY updated DESC"
+```
 
 ## Usage
 
 Execute: ./parse-logs.py <params>
 ```bash
 Possible params:
--i | --log_input     ... Input log file from 389-ds (needed)
--o | --log_output    ... Output log file for combined log (default: False)
--l | --log_lastbind  ... Logfile for last successful binds (default: False)
--s | --servername    ... Name of the server for the log lines (default: %s)
--e | --stage         ... Define the server environment p, v or d (default: p ... production)
--d | --syslog_host   ... Destination server for the syslog message (default: 127.0.0.1)
--p | --syslog_port   ... Destination port for the syslog message (default: 514)
--v | --syslog_value  ... Facility and level for the syslog message (default: 165)
--t | --stdout        ... Display combined log on stdout (default: True)
--h | --help... This message :)
+-i | --log_input       ... Input log file from 389-ds (needed)
+-o | --log_output      ... Output log file for combined log (default: False)
+-l | --log_lastbind    ... Logfile for last successful binds (default: False)
+-b | --lastbind_db     ... SQLite db for last successful binds (default: False)
+     --lastbind_ttl    ... Seconds to keep binds in the SQLite db, 0 = forever (default: 93600)
+-f | --state_file      ... File to save the state on stop and continue on start (default: False)
+     --max_connections ... Max number of connections kept in memory, 0 = unlimited (default: 100000)
+-s | --servername      ... Name of the server for the log lines (default: <hostname>)
+-e | --stage           ... Define the server environment p, v or d (default: p ... production)
+-d | --syslog_host     ... Destination server for the syslog message (default: 127.0.0.1)
+-p | --syslog_port     ... Destination port for the syslog message (default: 514)
+-v | --syslog_value    ... Facility and level for the syslog message (default: 165)
+-t | --stdout          ... Display combined log on stdout (default: True)
+-h | --help            ... This message :)
 
 To disable a output function use:
 --log_output=False    ... Write no combined logfile
 --log_lastbind=False  ... Write no lastbind logfile
 --syslog_host=False   ... Do not send a syslog message
 --stdout=False        ... Do not write to stdout
+
+Send SIGHUP to reopen the output files after a logrotate.
 ```
   
 ## Example
@@ -78,7 +85,6 @@ Known possible improvments:
 * Input hardening for some params
 * Error handling to fine grade exceptions
 * Code improvement for function params
-* Add params for redis and redis db
 * Add debugging options
   
 ## License

@@ -14,8 +14,12 @@ User=<serviceuser>
 Group=<serviceuser>
 PrivateTmp=true
 
+# state file and lastbind db are stored in /var/lib/parse-logs/
+StateDirectory=parse-logs
+
 WorkingDirectory=/opt/parse-logs/
-ExecStart=/usr/bin/env /usr/bin/python3 /opt/parse-logs/parse-logs.py --log_input=<file>.log <optional-params>
+ExecStart=/usr/bin/env /usr/bin/python3 /opt/parse-logs/parse-logs.py --log_input=<file>.log --state_file=/var/lib/parse-logs/state.json --lastbind_db=/var/lib/parse-logs/lastbind.db <optional-params>
+ExecReload=/bin/kill -HUP $MAINPID
 TimeoutSec=10
 
 Restart=on-failure
